@@ -378,6 +378,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI'
     <div class="mn-item" id="mn-calendar" onclick="nav('calendar')"><div class="mn-icon">📅</div><span>日历</span></div>
     <div class="mn-item" id="mn-manage" onclick="nav('manage')"><div class="mn-icon">⚙️</div><span>管理</span></div>
     <div class="mn-item" id="mn-journal" onclick="nav('journal')"><div class="mn-icon">📔</div><span>日记</span></div>
+    <div class="mn-item" onclick="openModal('m-data')"><div class="mn-icon">💾</div><span>更多</span></div>
   </div>
 </div>
 
@@ -726,6 +727,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI'
         <button class="btn btn-ghost" onclick="disconnectSupabase()">断开云端同步</button>
       </div>
       <div id="sb-status" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
+      <button class="btn btn-ghost" id="data-modal-logout-btn" style="display:none;margin-top:12px" onclick="doLogout()">🚪 退出登录</button>
     </div>
 
     <div class="data-section">
@@ -1065,6 +1067,11 @@ function showLoginError(msg) {
   el.textContent = msg;
   el.style.display = msg ? 'block' : 'none';
 }
+function setLoggedInUI(isLoggedIn) {
+  const display = isLoggedIn ? '' : 'none';
+  document.getElementById('logout-nav-item').style.display = display;
+  document.getElementById('data-modal-logout-btn').style.display = display;
+}
 async function doLogin() {
   const sb = getSupabaseClient();
   if (!sb) { showLoginError('云端同步未配置'); return; }
@@ -1077,7 +1084,7 @@ async function doLogin() {
     if (error) throw error;
     _currentUserId = data.user.id;
     hideLoginOverlay();
-    document.getElementById('logout-nav-item').style.display = '';
+    setLoggedInUI(true);
     await initRemoteSync();
   } catch(e) { showLoginError('登录失败：' + e.message); }
 }
@@ -1087,7 +1094,8 @@ async function doLogout() {
   _currentUserId = null;
   _state = null;
   localStorage.removeItem(LOCAL_CACHE_KEY);
-  document.getElementById('logout-nav-item').style.display = 'none';
+  setLoggedInUI(false);
+  closeModal('m-data');
   showLoginOverlay();
 }
 // Runs at startup: if cloud sync is configured, require a valid session before showing the app.
@@ -1097,7 +1105,7 @@ async function checkAuthAndInit() {
   const { data: { session } } = await sb.auth.getSession();
   if (session) {
     _currentUserId = session.user.id;
-    document.getElementById('logout-nav-item').style.display = '';
+    setLoggedInUI(true);
     await initRemoteSync();
   } else {
     showLoginOverlay();
