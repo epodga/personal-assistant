@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>个人管理助手</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <style>
 /* ── DESIGN TOKENS ── */
 :root {
@@ -204,6 +205,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI'
 /* ── MODAL ── */
 .overlay { position: fixed; inset: 0; background: rgba(15,23,42,.5); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); z-index: 500; display: none; align-items: center; justify-content: center; }
 .overlay.open { display: flex; }
+.login-overlay { position: fixed; inset: 0; background: rgba(15,23,42,.6); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); z-index: 9999; display: none; align-items: center; justify-content: center; }
+.login-overlay.open { display: flex; }
 .modal { background: #fff; border-radius: 20px; padding: 26px 28px; width: 500px; max-width: 95vw; max-height: 92vh; overflow-y: auto; box-shadow: var(--shadow-lg); }
 .modal-wide { width: 580px; }
 .modal-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; }
@@ -365,6 +368,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI'
   <div class="nav-item" onclick="nav('journal')"><span class="icon">📔</span>日记</div>
   <div class="sidebar-footer">
     <div class="nav-item" onclick="openModal('m-data')"><span class="icon">💾</span>数据管理</div>
+    <div class="nav-item" id="logout-nav-item" style="display:none" onclick="doLogout()"><span class="icon">🚪</span>退出登录</div>
   </div>
 </nav>
 
@@ -711,6 +715,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI'
     </div>
 
     <div class="data-section">
+      <div class="data-section-title">☁️ 云端同步（Supabase）</div>
+      <div class="info-box" style="margin-bottom:10px">
+        配置后数据会自动同步到云端，手机和电脑可以共享同一份数据。留空则仅保存在本机。
+      </div>
+      <div class="fg"><label>Supabase Project URL</label><input id="sb-url" type="text" placeholder="https://xxxxxxxx.supabase.co" style="font-family:monospace;font-size:13px"></div>
+      <div class="fg"><label>Supabase anon public key</label><input id="sb-key" type="text" placeholder="eyJxxxxx..." style="font-family:monospace;font-size:13px"></div>
+      <div class="data-btn-row" style="margin-top:8px">
+        <button class="btn btn-secondary" onclick="saveSupabaseConfig()">保存并连接</button>
+        <button class="btn btn-ghost" onclick="disconnectSupabase()">断开云端同步</button>
+      </div>
+      <div id="sb-status" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
+    </div>
+
+    <div class="data-section">
       <div class="data-section-title">存储信息</div>
       <div id="storage-info" class="info-box"></div>
     </div>
@@ -718,6 +736,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI'
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- LOGIN OVERLAY (only shown when Supabase cloud sync is configured) -->
+<div class="login-overlay" id="m-login">
+  <div class="modal" style="max-width:380px">
+    <div class="modal-hdr"><div class="modal-title">🔒 登录</div></div>
+    <div class="fg"><label>邮箱</label><input id="login-email" type="email" placeholder="you@example.com" autocomplete="username"></div>
+    <div class="fg"><label>密码</label><input id="login-password" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+    <div id="login-error" style="color:#dc2626;font-size:12px;margin-bottom:10px;display:none"></div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" style="width:100%" onclick="doLogin()">登录</button>
+    </div>
+  </div>
+</div>
 
 <script>
 // ════════════════════════════════════════════════
@@ -897,47 +928,37 @@ function sqlToState(sql) {
 }
 
 // ════════════════════════════════════════════════
-//  STATE MANAGEMENT
+//  STATE MANAGEMENT (local cache + Supabase cloud sync)
 // ════════════════════════════════════════════════
-const DB_KEY = 'ptm_db';
+const LOCAL_CACHE_KEY = 'ptm_state_cache';
+const SB_CONFIG_KEY = 'ptm_sb_config';
+
 let _state = null;
 let _persistTimer = null;
+let _sb = null;
+let _pushTimer = null;
+let _currentUserId = null;
+
+function emptyState() { return { routines: [], projects: [], todos: [], journals: [], monthlyTasks: [] }; }
 
 function getState() {
   if (!_state) {
-    const sql = localStorage.getItem(DB_KEY) || '';
-    _state = sql ? sqlToState(sql) : { routines: [], projects: [], todos: [], journals: [], monthlyTasks: [] };
+    const raw = localStorage.getItem(LOCAL_CACHE_KEY);
+    _state = raw ? JSON.parse(raw) : emptyState();
   }
   return _state;
 }
 
 function persist() {
-  if (_state) localStorage.setItem(DB_KEY, stateToSQL(_state));
+  if (!_state) return;
+  localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(_state));
+  clearTimeout(_pushTimer);
+  _pushTimer = setTimeout(pushToSupabase, 600);
 }
 
 function debouncedPersist() {
   clearTimeout(_persistTimer);
   _persistTimer = setTimeout(persist, 800);
-}
-
-// Migrate from old format (separate localStorage keys)
-function migrate() {
-  if (localStorage.getItem(DB_KEY)) return;
-  const old = {
-    routines: JSON.parse(localStorage.getItem('routines') || '[]'),
-    projects: JSON.parse(localStorage.getItem('projects') || '[]'),
-    todos:    JSON.parse(localStorage.getItem('todos')    || '[]'),
-    journals: JSON.parse(localStorage.getItem('journals') || '[]'),
-  };
-  if (!old.routines.length && !old.projects.length && !old.todos.length && !old.journals.length) return;
-  const now = new Date().toISOString();
-  old.routines.forEach(r => { if (!r.createdAt) r.createdAt = now; });
-  old.projects.forEach(p => { if (!p.createdAt) p.createdAt = now; });
-  old.todos.forEach(t => { if (!t.createdAt) t.createdAt = now; });
-  old.journals.forEach(j => { if (!j.createdAt) j.createdAt = now; });
-  _state = old;
-  persist();
-  ['routines','projects','todos','journals'].forEach(k => localStorage.removeItem(k));
 }
 
 // Merge imported state into current state
@@ -949,6 +970,138 @@ function mergeState(imported) {
     s[key] = Array.from(map.values());
   });
   persist();
+}
+
+// ── Supabase cloud sync ──
+// Single "app_state" table with one jsonb row holding the whole state object.
+// This means the schema never needs migrating as the app's data shape evolves.
+function getSbConfig() {
+  try { return JSON.parse(localStorage.getItem(SB_CONFIG_KEY) || '{}'); } catch(e) { return {}; }
+}
+function getSupabaseClient() {
+  if (_sb) return _sb;
+  const cfg = getSbConfig();
+  if (!cfg.url || !cfg.key) return null;
+  if (typeof supabase === 'undefined') return null;
+  _sb = supabase.createClient(cfg.url, cfg.key);
+  return _sb;
+}
+function setSbStatus(msg) {
+  const el = document.getElementById('sb-status');
+  if (el) el.textContent = msg;
+}
+function saveSupabaseConfig() {
+  const url = document.getElementById('sb-url').value.trim();
+  const key = document.getElementById('sb-key').value.trim();
+  if (!url || !key) { alert('请输入 Project URL 和 anon key'); return; }
+  localStorage.setItem(SB_CONFIG_KEY, JSON.stringify({ url, key }));
+  _sb = null;
+  setSbStatus('正在连接…');
+  closeModal('m-data');
+  checkAuthAndInit();
+}
+function disconnectSupabase() {
+  localStorage.removeItem(SB_CONFIG_KEY);
+  _sb = null;
+  setSbStatus('已断开，仅使用本机存储');
+}
+async function pushToSupabase() {
+  const sb = getSupabaseClient();
+  if (!sb || !_state || !_currentUserId) return;
+  try {
+    const { error } = await sb.from('app_state').upsert({ user_id: _currentUserId, data: _state, updated_at: new Date().toISOString() });
+    if (error) throw error;
+    setSbStatus('✅ 已同步到云端');
+  } catch(e) { setSbStatus('❌ 同步失败：' + e.message); }
+}
+async function pullFromSupabase() {
+  const sb = getSupabaseClient();
+  if (!sb || !_currentUserId) return false;
+  try {
+    const { data, error } = await sb.from('app_state').select('data').eq('user_id', _currentUserId).maybeSingle();
+    if (error) throw error;
+    if (data && data.data) {
+      _state = data.data;
+      localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(_state));
+      return true;
+    }
+    return false;
+  } catch(e) { setSbStatus('❌ 拉取失败：' + e.message); return false; }
+}
+function subscribeRealtime() {
+  const sb = getSupabaseClient();
+  if (!sb || !_currentUserId) return;
+  sb.channel('app_state_sync_' + _currentUserId)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state', filter: `user_id=eq.${_currentUserId}` }, payload => {
+      if (payload.new && payload.new.data) {
+        _state = payload.new.data;
+        localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(_state));
+        refreshCurrent();
+        setSbStatus('✅ 已从云端更新（其他设备有改动）');
+      }
+    })
+    .subscribe();
+}
+async function initRemoteSync() {
+  const sb = getSupabaseClient();
+  if (!sb || !_currentUserId) return;
+  const pulled = await pullFromSupabase();
+  if (!pulled) await pushToSupabase(); // first-time: seed cloud with current local state
+  refreshCurrent();
+  if (document.querySelector('.page.active')?.id === 'p-journal') renderJList();
+  subscribeRealtime();
+  setSbStatus('✅ 云端同步已连接');
+}
+
+// ── Auth (login required whenever cloud sync is configured) ──
+function showLoginOverlay() {
+  document.getElementById('m-login').classList.add('open');
+}
+function hideLoginOverlay() {
+  document.getElementById('m-login').classList.remove('open');
+}
+function showLoginError(msg) {
+  const el = document.getElementById('login-error');
+  el.textContent = msg;
+  el.style.display = msg ? 'block' : 'none';
+}
+async function doLogin() {
+  const sb = getSupabaseClient();
+  if (!sb) { showLoginError('云端同步未配置'); return; }
+  const email = document.getElementById('login-email').value.trim();
+  const password = document.getElementById('login-password').value;
+  if (!email || !password) { showLoginError('请输入邮箱和密码'); return; }
+  showLoginError('');
+  try {
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
+    if (error) throw error;
+    _currentUserId = data.user.id;
+    hideLoginOverlay();
+    document.getElementById('logout-nav-item').style.display = '';
+    await initRemoteSync();
+  } catch(e) { showLoginError('登录失败：' + e.message); }
+}
+async function doLogout() {
+  const sb = getSupabaseClient();
+  if (sb) await sb.auth.signOut().catch(()=>{});
+  _currentUserId = null;
+  _state = null;
+  localStorage.removeItem(LOCAL_CACHE_KEY);
+  document.getElementById('logout-nav-item').style.display = 'none';
+  showLoginOverlay();
+}
+// Runs at startup: if cloud sync is configured, require a valid session before showing the app.
+async function checkAuthAndInit() {
+  const sb = getSupabaseClient();
+  if (!sb) return; // no cloud sync configured — local-only mode, no login needed
+  const { data: { session } } = await sb.auth.getSession();
+  if (session) {
+    _currentUserId = session.user.id;
+    document.getElementById('logout-nav-item').style.display = '';
+    await initRemoteSync();
+  } else {
+    showLoginOverlay();
+  }
 }
 
 // ════════════════════════════════════════════════
@@ -2471,7 +2624,13 @@ function pickColor(c, type, cid) {
 // ════════════════════════════════════════════════
 function openModal(id) {
   document.getElementById(id).classList.add('open');
-  if (id === 'm-data') updateStorageInfo();
+  if (id === 'm-data') {
+    updateStorageInfo();
+    const cfg = getSbConfig();
+    document.getElementById('sb-url').value = cfg.url || '';
+    document.getElementById('sb-key').value = cfg.key || '';
+    setSbStatus(cfg.url ? '已配置，正在使用云端同步' : '未配置，仅保存在本机');
+  }
 }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); editingId=null; }
 document.querySelectorAll('.overlay').forEach(o => {
@@ -2564,18 +2723,18 @@ function delJournal(id) {
 //  IMPORT / EXPORT
 // ════════════════════════════════════════════════
 function updateStorageInfo() {
-  const sql = localStorage.getItem(DB_KEY) || '';
   const s = getState();
-  const bytes = new Blob([sql]).size;
+  const bytes = new Blob([JSON.stringify(s)]).size;
   const kb = (bytes / 1024).toFixed(1);
+  const cloudLine = getSbConfig().url ? '云端（Supabase）+ 本机缓存' : '仅本机（localStorage）';
   document.getElementById('storage-info').innerHTML =
-    `<b>存储格式：</b>SQL（localStorage）<br>
+    `<b>存储位置：</b>${cloudLine}<br>
      <b>数据大小：</b>${kb} KB<br>
      <b>记录数：</b>Routines ${s.routines.length} 条 · Projects ${s.projects.length} 条 · To-dos ${s.todos.length} 条 · 日记 ${s.journals.length} 篇`;
 }
 
 function exportSQL() {
-  const sql = localStorage.getItem(DB_KEY) || stateToSQL(getState());
+  const sql = stateToSQL(getState());
   const date = todayStr();
   downloadFile(sql, `task-manager-${date}.sql`, 'text/plain;charset=utf-8');
   toast('SQL 文件已导出', 'success');
@@ -2752,7 +2911,6 @@ function downloadTemplate() {
 //  INIT
 // ════════════════════════════════════════════════
 (function init() {
-  migrate();
   syncMonthlyTodos();
   dashDate = todayStr();
   const picker = document.getElementById('dash-date-picker');
@@ -2771,6 +2929,7 @@ function downloadTemplate() {
     }, { passive: false });
   }
   _updateGutterThumb();
+  checkAuthAndInit(); // if cloud sync is configured, requires login before showing data
 })();
 </script>
 </body>
